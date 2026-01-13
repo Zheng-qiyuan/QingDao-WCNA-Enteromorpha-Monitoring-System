@@ -1,0 +1,390 @@
+// =========================================
+// 1. 研究区与基础设置 (Spatial & Basic Setup)
+// =========================================
+
+// 1.1 核心矢量
+var qingdao_full = ee.FeatureCollection("users/Qiyuan_Zheng/myshapes");
+var centerPoint = ee.Geometry.Point([120.0, 35.85]); 
+
+// 1.2 科学监测区构建 (Study Area)
+var huangdao_fc = qingdao_full.filterBounds(centerPoint);
+var geometry_huangdao = huangdao_fc.geometry().simplify(100); 
+
+// 陆地掩膜 (用于挖除)
+var shandong_geo = ee.FeatureCollection("FAO/GAUL/2015/level1")
+    .filter(ee.Filter.eq('ADM1_NAME', 'Shandong'))
+    .geometry().simplify(300); 
+var qingdao_geo = qingdao_full.geometry().simplify(300);
+var land_mask = shandong_geo.union(qingdao_geo).simplify(300);
+
+// 象限掩膜 (只保留东侧)
+var east_side_mask = ee.Geometry.Rectangle([120.0, 35.0, 122.0, 36.5]); 
+
+// 生成最终监测区
+var raw_buffer = geometry_huangdao.buffer(22224, 100); 
+var study_area = raw_buffer
+    .intersection(east_side_mask, 100)
+    .difference(land_mask, 100); 
+
+// 1.3 地图初始化
+Map.centerObject(centerPoint, 10);
+Map.setOptions('HYBRID'); 
+Map.style().set('cursor', 'crosshair');
+
+// =========================================
+// 2. 核心算法 (Core Algorithms)
+// =========================================
+
+var NDVI_THRESHOLD = 0.10; 
+var water_mask = ee.Image("JRC/GSW1_4/GlobalSurfaceWater")
+    .select('occurrence').gt(80).unmask(0);
+
+// 全球影像获取 (用于全屏底图)
+function getGlobalS2(year) {
+  var start = year + '-06-10'; 
+  var end = year + '-07-25';
+  return ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+}
+
+// 监测区影像获取 (用于分析)
+function getAnalysisS2(year) {
+  var start = year + '-06-10'; 
+  var end = year + '-07-25';
+  return ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    .filterBounds(study_area)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20));
+}
+
+// 浒苔提取 (科学去泥沙版)
+function extractAlgae(img) {
+    var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+    var is_algae_spectrum = img.select('B4').lt(1200); // 泥沙过滤
+    return img.addBands(ndvi)
+              .updateMask(water_mask)     
+              .updateMask(is_algae_spectrum)
+              .clip(study_area)
+              .copyProperties(img, ['system:time_start']); 
+}
+
+// =========================================
+// 3. 全局状态管理 (Global State)
+// =========================================
+var appState = {
+  currentYear: '2023',
+  processedCol: null, 
+  binaryLayer: null,  
+  heatmapLayer: null, 
+  currentLayer: null, 
+  statsArea: 0
+};
+
+// =========================================
+// 4. 交互式 UI 设计 (Advanced UI)
+// =========================================
+
+ui.root.clear(); 
+
+var panel = ui.Panel({
+  style: {
+    width: '400px', 
+    padding: '15px', 
+    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+    border: '1px solid #dcdcdc', 
+    position: 'top-right'
+  }
+});
+
+var map = ui.Map();
+map.centerObject(centerPoint, 10);
+Map.setOptions('HYBRID');
+ui.root.add(panel);
+ui.root.add(map);
+
+// --- 4.1 标题区 ---
+panel.add(ui.Label({
+  value: '🌊 Enteromorpha Interactive System',
+  style: {fontSize: '22px', fontWeight: '900', color: '#1f618d', margin: '0 0 5px 0'}
+}));
+panel.add(ui.Label({
+  value: 'Qingdao West Coast New Area',
+  style: {fontSize: '12px', color: '#555', margin: '0 0 15px 0'}
+}));
+
+// --- 4.2 控制区 (年份 & 样式) ---
+panel.add(ui.Label('1. Control Panel', {fontWeight: 'bold', fontSize: '14px', margin: '10px 0'}));
+
+// A. 年份选择
+var selectYear = ui.Select({
+  items: ['2023', '2022', '2021', '2020', '2019'],
+  placeholder: 'Select Year...', 
+  onChange: function(year) {
+    runAnalysis(year); 
+  },
+  style: {width: '100%', margin: '0 0 10px 0'}
+});
+panel.add(ui.Label('Monitoring Year:', {fontSize: '11px', color: '#777'}));
+panel.add(selectYear);
+
+// B. 显示模式
+var layerMode = ui.Select({
+  items: [
+    {label: '🛑 Classification (Binary)', value: 'binary'},
+    {label: '🌈 Intensity Heatmap (NDVI)', value: 'heatmap'}
+  ],
+  value: 'binary',
+  onChange: updateVisualization, 
+  style: {width: '100%', margin: '0 0 10px 0'}
+});
+panel.add(ui.Label('Display Mode:', {fontSize: '11px', color: '#777'}));
+panel.add(layerMode);
+
+// C. 颜色主题 
+var colorTheme = ui.Select({
+  items: [
+    {label: '🚨 Standard Red', value: 'FF0000'},
+    {label: '👽 Cyber Green', value: '00FF00'},
+    {label: '🍊 Warning Orange', value: 'FFA500'},
+    {label: '🔮 Deep Purple', value: '800080'},
+    {label: '🎲 Random Color', value: 'random'}
+  ],
+  value: 'FF0000',
+  onChange: updateVisualization,
+  style: {width: '100%', margin: '0 0 10px 0'}
+});
+panel.add(ui.Label('Color Theme:', {fontSize: '11px', color: '#777'}));
+panel.add(colorTheme);
+
+// D. 透明度滑块
+var opacitySlider = ui.Slider({
+  min: 0, max: 1, value: 0.9, step: 0.1,
+  style: {width: '95%'},
+  onChange: function(value) {
+    var layers = map.layers();
+    if (layers.length() > 2) { 
+       layers.get(2).setOpacity(value);
+    }
+  }
+});
+panel.add(ui.Label('Algae Layer Opacity:', {fontSize: '11px', color: '#777'}));
+panel.add(opacitySlider);
+
+// --- 4.3 结果展示区 ---
+var resultPanel = ui.Panel();
+panel.add(resultPanel);
+
+// --- 4.4 点位侦测区 ---
+panel.add(ui.Label('2. Point Inspector', {fontWeight: 'bold', fontSize: '14px', margin: '15px 0 5px 0'}));
+var inspectorPanel = ui.Panel({
+  style: {border: '1px dashed #aaa', padding: '8px', backgroundColor: '#f9f9f9'}
+});
+inspectorPanel.add(ui.Label('Click on the map to inspect NDVI trend.', {fontSize: '11px', color: 'gray'}));
+panel.add(inspectorPanel);
+
+// --- 4.5 数据下载区 ---
+panel.add(ui.Label('3. Data Export', {fontWeight: 'bold', fontSize: '14px', margin: '15px 0 5px 0'}));
+var downloadPanel = ui.Panel({layout: ui.Panel.Layout.flow('horizontal')});
+panel.add(downloadPanel);
+
+// =========================================
+// 5. 分析执行逻辑
+// =========================================
+
+function runAnalysis(year) {
+  appState.currentYear = year;
+  
+  // 重置状态
+  map.layers().reset();
+  resultPanel.clear();
+  inspectorPanel.clear();
+  downloadPanel.clear();
+  inspectorPanel.add(ui.Label('Click map to inspect point in ' + year + '...', {fontSize: '11px', color: 'gray'}));
+  resultPanel.add(ui.Label('Processing ' + year + '...', {color: 'gray'}));
+
+  var s2_global = getGlobalS2(year);
+  var s2_analysis = getAnalysisS2(year);
+
+  s2_analysis.size().evaluate(function(count) {
+    if (count === 0) {
+      resultPanel.clear();
+      resultPanel.add(ui.Label('No images found for ' + year, {color: 'red'}));
+      return;
+    }
+
+    // 1. 全屏底图 (中值合成)
+    var global_mosaic = s2_global.median(); 
+    var rgbVis = {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000, gamma: 1.1};
+    map.addLayer(global_mosaic, rgbVis, 'True Color (' + year + ')', true);
+
+    // 2. 边界装饰
+    var empty = ee.Image().byte();
+    var outline = empty.paint({featureCollection: huangdao_fc, color: 1, width: 2});
+    map.addLayer(outline, {palette: ['FFD700']}, 'Huangdao', true, 1.0);
+
+    // 3. 浒苔计算
+    var s2_processed = s2_analysis.map(extractAlgae);
+    appState.processedCol = s2_processed; 
+
+    var max_mosaic = s2_processed.qualityMosaic('NDVI');
+    
+    // 【关键】：准备两套数据供切换
+    // A: 二值数据 (用于 Classification 模式)
+    appState.binaryLayer = max_mosaic.select('NDVI').gt(NDVI_THRESHOLD).selfMask();
+    // B: 热力数据 (用于 Heatmap 模式)
+    appState.heatmapLayer = max_mosaic.select('NDVI').updateMask(appState.binaryLayer);
+    
+    // 4. 调用可视化更新函数 (瞬间渲染)
+    updateVisualization();
+
+    // 5. 统计面积
+    var area_img = appState.binaryLayer.multiply(ee.Image.pixelArea());
+    var stats = area_img.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: study_area,
+      scale: 100, maxPixels: 1e13
+    });
+    
+    // 6. 区域趋势图
+    var chart = ui.Chart.image.series({
+      imageCollection: s2_processed.select('NDVI'), 
+      region: study_area,
+      reducer: ee.Reducer.max(),
+      scale: 500, xProperty: 'system:time_start'
+    }).setOptions({
+      title: 'Regional Bloom Intensity',
+      vAxis: {title: 'Max NDVI'},
+      hAxis: {title: 'Date', format: 'MM-dd'},
+      colors: ['#27ae60'], height: 180, legend: {position: 'none'}
+    });
+
+    stats.evaluate(function(val) {
+      resultPanel.clear();
+      var area_km2 = (val['NDVI'] || 0) / 1e6;
+      appState.statsArea = area_km2;
+      
+     
+      resultPanel.add(ui.Label('Total Area: ' + area_km2.toFixed(2) + ' km²', {
+        color: '#d32f2f', fontWeight: '900', fontSize: '28px', margin: '5px 0'
+      }));
+      resultPanel.add(chart);
+      
+    
+      updateDownloadButtons();
+    });
+  });
+}
+
+
+function updateVisualization() {
+ 
+  if (!appState.binaryLayer) return;
+  var layers = map.layers();
+  if (layers.length() > 2) {
+    layers.remove(layers.get(2));
+  }
+  
+  var mode = layerMode.getValue();
+  var colorCode = colorTheme.getValue();
+  
+  // 处理随机色
+  if (colorCode === 'random') {
+    colorCode = Math.floor(Math.random()*16777215).toString(16);
+  }
+  
+  var layerToAdd, visParams, layerName;
+  
+  if (mode === 'binary') {
+    // 模式 A: 二值图
+    layerToAdd = appState.binaryLayer;
+    visParams = {palette: [colorCode]}; 
+    layerName = 'Algae (Binary)';
+  } else {
+    // 模式 B: 热力图 (从白/黄渐变到选定颜色)
+    layerToAdd = appState.heatmapLayer;
+    visParams = {min: 0.1, max: 0.6, palette: ['white', 'yellow', colorCode]};
+    layerName = 'Intensity (Heatmap)';
+  }
+  
+  // 3. 更新当前图层 (用于下载)
+  appState.currentLayer = layerToAdd;
+  
+  // 4. 添加到地图
+  var layer = map.addLayer(layerToAdd, visParams, layerName, true);
+  layer.setOpacity(opacitySlider.getValue());
+}
+
+// =========================================
+// 6. 交互功能实现
+// =========================================
+
+// --- 功能 A: 地图点击侦测 ---
+map.onClick(function(coords) {
+  if (!appState.processedCol) return; 
+
+  inspectorPanel.clear();
+  inspectorPanel.add(ui.Label('Computing point data...', {color: 'gray'}));
+  
+  var point = ee.Geometry.Point([coords.lon, coords.lat]);
+  
+  // 添加点击点
+  var dot = ui.Map.Layer(point, {color: 'blue'}, 'Clicked Point');
+  map.layers().set(3, dot); 
+  
+  var pointChart = ui.Chart.image.series({
+    imageCollection: appState.processedCol.select('NDVI'),
+    region: point,
+    reducer: ee.Reducer.mean(),
+    scale: 10, 
+    xProperty: 'system:time_start'
+  }).setOptions({
+    title: 'NDVI Trend at Point',
+    vAxis: {title: 'NDVI'},
+    hAxis: {title: 'Date', format: 'MM-dd'},
+    colors: ['#1f618d'], 
+    height: 150, 
+    legend: {position: 'none'}
+  });
+  
+  inspectorPanel.clear();
+  inspectorPanel.add(ui.Label('Lon: ' + coords.lon.toFixed(4) + ', Lat: ' + coords.lat.toFixed(4), {fontSize: '10px'}));
+  inspectorPanel.add(pointChart);
+});
+
+// --- 功能 B: 数据下载 ---
+function updateDownloadButtons() {
+  downloadPanel.clear();
+  
+  // CSV
+  var statsFeature = ee.Feature(null, {
+    'year': appState.currentYear,
+    'total_area_km2': appState.statsArea,
+    'note': 'Generated by GEE Enteromorpha App'
+  });
+  var statsCol = ee.FeatureCollection([statsFeature]);
+  var csvUrl = statsCol.getDownloadURL({format: 'csv', filename: 'Algae_Stats_' + appState.currentYear});
+  
+  downloadPanel.add(ui.Label({
+    value: '📥 CSV Stats',
+    style: {color: 'blue', border: '1px solid blue', padding: '5px', margin: '0 5px 0 0'},
+    targetUrl: csvUrl
+  }));
+  
+  // GeoTIFF
+  if (appState.currentLayer) {
+    var downloadArgs = {
+      name: 'Algae_Map_' + appState.currentYear,
+      crs: 'EPSG:4326',
+      scale: 100, 
+      region: study_area
+    };
+    var tiffUrl = appState.currentLayer.getDownloadURL(downloadArgs);
+    
+    downloadPanel.add(ui.Label({
+      value: '🌍 GeoTIFF Map',
+      style: {color: 'green', border: '1px solid green', padding: '5px'},
+      targetUrl: tiffUrl
+    }));
+  }
+}
